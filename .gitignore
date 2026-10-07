@@ -1,0 +1,9 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+bot.log
+playlists.json
+*.bak
+*.bak2
+bot.log.*

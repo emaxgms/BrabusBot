@@ -1,0 +1,19 @@
+[Unit]
+Description=Discord music bot
+After=network-online.target
+# stop hammering if the token is missing/wrong
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+WorkingDirectory=/home/ema/projects/discord-music-bot
+ExecStart=/home/ema/projects/discord-music-bot/.venv/bin/python bot.py
+Environment=PYTHONUNBUFFERED=1
+# journalctl --user has no storage on this host -> keep our own log
+StandardOutput=append:/home/ema/projects/discord-music-bot/bot.log
+StandardError=append:/home/ema/projects/discord-music-bot/bot.log
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
