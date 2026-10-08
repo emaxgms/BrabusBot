@@ -14,8 +14,12 @@ jumps the queue. `/plsave <name>` with no query snapshots the current queue.
 `/move 14 1` moves queue position 14 to position 1 (the target is clamped, so `/move 3 999`
 sends it to the end).
 
-Panel buttons: ➕ add (paste a link or search) · ↕️ order (reorder the queue) · ⏯ play/pause ·
-⏭ skip · 🔀 shuffle · 📜 queue · ⏹ stop & disconnect
+Panel buttons: 🔊 join (the bot enters your voice channel) · ➕ add (paste a link or search) ·
+↕️ order (reorder the queue) · ⏯ play/pause · ⏭ skip · 🔀 shuffle · 📜 queue · ⏹ stop & disconnect
+
+`🔊 join` is the one button that works before the bot is connected: `/play` connects as a
+side effect, this does it on its own (and arms the idle timer, so it leaves again if nothing
+gets queued).
 
 `↕️ order` opens a modal pre-filled with `1 2 3 …`: rewrite it as the permutation you want
 (`3 1 2 …`) and submit. Discord has no drag & drop and a modal holds at most 5 fields, so the

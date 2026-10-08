@@ -738,6 +738,22 @@ class Panel(discord.ui.View):
         # Discord only ever shows "interaction failed" - keep the real cause in bot.log.
         print(f"panel[{getattr(item, 'custom_id', '?')}] failed: {error!r}", file=sys.stderr, flush=True)
 
+    @discord.ui.button(emoji="🔊", label="Join", style=discord.ButtonStyle.success, custom_id="mb:join")
+    async def join(self, i: discord.Interaction, _b):
+        # The only button that must NOT go through _player(): connecting is exactly the state
+        # _player rejects ("Not connected"), so it does its own, weaker check.
+        if i.user.voice is None or i.user.voice.channel is None:
+            return await _say(i, "Join a voice channel first.")
+        p = i.client.players.setdefault(i.guild_id, Player(i.client, i.guild))
+        p.channel = i.channel  # so the panel refresh/repost lands in this channel
+        await i.response.defer()
+        try:
+            await p.connect(i.user.voice.channel)
+        except Exception as e:  # missing Connect/Speak permission, channel full...
+            return await i.followup.send(f"Could not join: `{e}`", ephemeral=True)
+        p.arm_idle()  # joined with nothing queued: do not squat in the channel forever
+        await p.refresh()
+
     @discord.ui.button(emoji="➕", label="Add", style=discord.ButtonStyle.success, custom_id="mb:add")
     async def add(self, i: discord.Interaction, _b):
         if not await _player(i):
@@ -1243,8 +1259,8 @@ def _check() -> int:
         m = AddModal()              # the Add button's modal: no text input => nothing to paste into
         om = OrderModal(3)          # the Order button's modal: pre-filled with the current order
         return [
-            len(v.children) == 7 and all(isinstance(c, discord.ui.Button) for c in v.children),
-            {"mb:add", "mb:order"} <= {c.custom_id for c in v.children},
+            len(v.children) == 8 and all(isinstance(c, discord.ui.Button) for c in v.children),
+            {"mb:join", "mb:add", "mb:order"} <= {c.custom_id for c in v.children},
             stopped is not None and not stopped.done(),
             len(m.children) == 1 and isinstance(m.children[0], discord.ui.TextInput),
             len(om.children) == 1 and om.order.default == "1 2 3",
