@@ -29,6 +29,7 @@ from functools import partial
 
 import discord
 import yt_dlp
+from yt_dlp.utils import YoutubeDLError
 from discord.ext import commands
 
 # --------------------------------------------------------------------------- config
@@ -157,12 +158,33 @@ def spotify_queries(url: str) -> list[tuple[str, str]]:
     return out
 
 
+class ResolveError(RuntimeError):
+    """A resolve failure whose text is written for the user; raw yt-dlp stderr goes to bot.log."""
+
+
+def human_ytdlp_error(err: Exception) -> str:
+    """Map the yt-dlp one-liners users actually hit onto something actionable."""
+    raw = str(err)
+    low = raw.lower()
+    if "confirm your age" in low:
+        return "that video is age-restricted — set YTDLP_COOKIES to play it"
+    if "not available" in low or "unavailable" in low or "private video" in low:
+        return "YouTube says that video is not available (removed, private or region-locked)"
+    if "sign in" in low or ("bot" in low and "check" in low):
+        return "YouTube wants a sign-in (bot check) — set YTDLP_COOKIES to play it"
+    if "unsupported url" in low:
+        return "that site is not supported by yt-dlp"
+    return re.sub(r"^ERROR:\s*", "", raw.splitlines()[0])[:160] or "unknown yt-dlp error"
+
+
 def resolve(query: str, skipped: list[str] | None = None, progress: "Progress | None" = None) -> list[Track]:
     """Blocking. URL or plain search text -> playable tracks.
 
     Tracks that cannot be resolved (age-gated, deleted, region-locked, bot-checked) go to
     `skipped` instead of raising: one dead hit must not kill the other 49 of a playlist.
     `progress` is bumped per entry so a slow playlist can show a moving counter.
+    A failure that makes the WHOLE query unusable raises `ResolveError`, whose message is
+    written for the user - the raw yt-dlp text only ever goes to bot.log.
     """
     if SPOTIFY_RE.search(query):
         tracks = []
@@ -197,8 +219,13 @@ def resolve(query: str, skipped: list[str] | None = None, progress: "Progress | 
         query = "ytsearch1:" + query
     if progress:
         progress.note = "yt-dlp"  # one extract: a YouTube playlist arrives whole, no counter
-    with ydl() as y:
-        info = y.extract_info(query, download=False)
+    try:
+        with ydl() as y:
+            info = y.extract_info(query, download=False)
+    except YoutubeDLError as e:
+        # the user gets one actionable line; the raw yt-dlp stderr stays in bot.log
+        print(f"resolve: {query[:80]!r}: {str(e).splitlines()[0][:200]}", flush=True)
+        raise ResolveError(human_ytdlp_error(e)) from e
     entries = [e for e in (info.get("entries") or []) if e]
     if entries:
         return [Track(e.get("title") or "unknown",
@@ -307,13 +334,20 @@ def progress_embed(pr: Progress, elapsed: float) -> discord.Embed:
         left = elapsed / pr.done * (pr.total - pr.done) if pr.done else 0
         line = f"`{bar}` {pr.done}/{pr.total}" + (f" · ~{left:.0f}s left" if pr.total > pr.done else "")
     else:
-        line = "⏳ resolving"  # one extract, nothing to count per-track
+        # No total to count against: a playlist comes back from ONE flat extract, so there is
+        # nothing to increment. The bar must still MOVE - a static "resolving" is exactly what
+        # a user reads as "the bot hung" on a long playlist.
+        i = int(elapsed * 2) % 12
+        line = f"`{''.join('▓' if i <= k < i + 3 else '░' for k in range(12))}` ⏳ resolving"
     return discord.Embed(title="Loading", colour=0x5865F2,
                          description=f"{line}\n{pr.note or '…'} · {elapsed:.0f}s")
 
 
-async def resolve_with_progress(channel, query: str, skipped: list[str]) -> tuple[list[Track], "discord.Message | None"]:
+async def resolve_with_progress(send_embed, query: str, skipped: list[str]) -> tuple[list[Track], "discord.Message | None"]:
     """resolve() off the event loop, with a progress line that only appears if it is slow.
+
+    `send_embed(embed=...) -> message` is how the line gets posted: `ctx.channel.send` for a
+    command, an ephemeral followup for a modal - so both surfaces show the same feedback.
 
     ponytail: the worker thread only bumps ints (atomic under the GIL), the loop polls them
     once a second - no locks, no cross-thread callbacks. 3s grace so one song never flashes.
@@ -331,7 +365,7 @@ async def resolve_with_progress(channel, query: str, skipped: list[str]) -> tupl
             continue
         if msg is None:
             if el >= 3:
-                msg = await channel.send(embed=progress_embed(pr, el))
+                msg = await send_embed(embed=progress_embed(pr, el))
         else:
             try:
                 await msg.edit(embed=progress_embed(pr, el))
@@ -658,7 +692,18 @@ async def _player(i: discord.Interaction) -> "Player | None":
     return p
 
 
-class AddModal(discord.ui.Modal, title="Add to queue"):
+class _LoggedModal(discord.ui.Modal):
+    """Modals have their OWN on_error - an exception in on_submit is otherwise invisible.
+
+    Panel.on_error does not cover them, Discord only shows "interaction failed", and
+    `bot.run(log_handler=None)` mutes the library logger, so the real cause earns nowhere.
+    """
+
+    async def on_error(self, i: discord.Interaction, error: Exception) -> None:  # no `item`: Modal has none
+        print(f"modal[{type(self).__name__}] failed: {error!r}", file=sys.stderr, flush=True)
+
+
+class AddModal(_LoggedModal, title="Add to queue"):
     """Discord has no inline text input in a message - a modal is the only one there is.
 
     ponytail: one-shot, no persistence. The last link is not remembered; that would be RAM
@@ -673,8 +718,15 @@ class AddModal(discord.ui.Modal, title="Add to queue"):
         p = await _player(i)  # re-checked: the user may have left voice while typing
         if p is None:
             return
+
+        # Same feedback as /play: pasting a long playlist MUST show the moving loader, or the
+        # button looks dead for a minute (that is the bug, the resolve itself was fine).
+        async def send_embed(embed):
+            return await i.followup.send(embed=embed, ephemeral=True, wait=True)
+
+        skipped: list[str] = []
         try:
-            tracks = await asyncio.to_thread(resolve, self.link.value)
+            tracks, msg = await resolve_with_progress(send_embed, self.link.value, skipped)
         except Exception as e:
             return await i.followup.send(f"Could not resolve that: `{e}`", ephemeral=True)
         if not tracks:
@@ -682,7 +734,11 @@ class AddModal(discord.ui.Modal, title="Add to queue"):
         await p.enqueue(tracks, i.user.display_name)
         await p.to_bottom()  # keep the panel at the bottom after adding
         head = tracks[0].label if len(tracks) == 1 else f"{len(tracks)} tracks"
-        await i.followup.send(f"➕ Queued {head}", ephemeral=True)
+        text = f"➕ Queued {head}" + (f"\n⚠️ {len(skipped)} unavailable" if skipped else "")
+        if msg is not None:
+            await msg.edit(content=text, embed=None)  # the loading line becomes the answer
+        else:
+            await i.followup.send(text, ephemeral=True)
 
 
 def parse_order(text: str) -> list[int]:
@@ -698,7 +754,7 @@ def queue_order(q: list[Track], order: list[int]) -> bool:
     return True
 
 
-class OrderModal(discord.ui.Modal, title="Reorder the queue"):
+class OrderModal(_LoggedModal, title="Reorder the queue"):
     """Type the new order as positions; the field is pre-filled with the current one.
 
     ponytail: Discord has no drag & drop and a modal holds at most 5 fields, so the whole
@@ -882,7 +938,7 @@ async def enqueue_query(ctx: commands.Context, query: str, front: bool = False) 
         tracks = saved  # saved entries are already resolved: nothing to look up
     else:
         try:
-            tracks, msg = await resolve_with_progress(ctx.channel, query, skipped)
+            tracks, msg = await resolve_with_progress(ctx.channel.send, query, skipped)
         except Exception as e:
             return await ctx.send(f"Could not resolve that: `{e}`")
     if not tracks:
@@ -1478,7 +1534,7 @@ def _check() -> int:
         globals()["resolve"] = slow
         try:
             ch = _ProgressChan()
-            tracks, msg = await resolve_with_progress(ch, "x", [])  # type: ignore[arg-type]
+            tracks, msg = await resolve_with_progress(ch.send, "x", [])  # type: ignore[arg-type]
             shown = ch.edits[-1] if ch.edits else ""
             return [len(ch.sent) == 1,               # posted once, not per poll
                     len(ch.edits) >= 1,              # and then updated in place
@@ -1504,7 +1560,7 @@ def _check() -> int:
         try:
             ch = _ProgressChan()
             try:
-                await resolve_with_progress(ch, "x", [])  # type: ignore[arg-type]
+                await resolve_with_progress(ch.send, "x", [])  # type: ignore[arg-type]
                 return [False]
             except RuntimeError:
                 return [len(ch.sent) == 1, "deleted" in ch.edits]
@@ -1513,6 +1569,37 @@ def _check() -> int:
 
     flags = asyncio.run(progress_error_ok())
     t("progress line cleaned up on failure", all(flags), f"{sum(flags)}/{len(flags)} asserts")
+
+    # A playlist has no total to count against, so its bar can only be indeterminate - but it
+    # MUST move. A static "uptime" line is what a user reports as "the bot is stuck loading".
+    def indeterminate_ok() -> list[bool]:
+        pr = Progress(note="yt-dlp")
+        frames = [progress_embed(pr, s / 2).description for s in range(6)]
+        bars = [f.split("`")[1] for f in frames]
+        return [all("▓" in b and "░" in b for b in bars),
+                len(set(bars)) > 2,               # it actually travels, not a fixed frame
+                "yt-dlp" in frames[0] and "resolving" in frames[0]]
+
+    flags = indeterminate_ok()
+    t("playlist loader bar moves", all(flags), f"{sum(flags)}/{len(flags)} asserts")
+
+    # one dead video must not surface as a raw yt-dlp stderr dump in Discord
+    def human_error_ok() -> list[bool]:
+        raw = "ERROR: [youtube] l4w7mevweXA: This video is not available"
+        cases = [human_ytdlp_error(RuntimeError(raw)),
+                 human_ytdlp_error(RuntimeError("ERROR: [youtube] x: Sign in to confirm your age")),
+                 human_ytdlp_error(RuntimeError("ERROR: Unsupported URL: ftp://x"))]
+        return [("not available" in cases[0] and "region-locked" in cases[0]),
+                "YTDLP_COOKIES" in cases[1],
+                "not supported" in cases[2],
+                "ERROR:" not in "".join(cases)]      # no raw prefix leaks through
+
+    flags = human_error_ok()
+    t("resolve errors are human-readable", all(flags), f"{sum(flags)}/{len(flags)} asserts")
+
+    t("modals log their own errors",
+      AddModal.on_error is OrderModal.on_error is getattr(_LoggedModal, "on_error"),
+      "Modal.on_error, not Panel.on_error - the two are separate callbacks")
 
     # a skip pressed while a transition is resolving must survive the guard, or the track
     # being resolved plays anyway and the button looks dead

@@ -71,7 +71,12 @@ against a fake voice client. All against the live network except the last two.
 ## Notes
 
 - Long resolves (a big Spotify album) show a progress embed after 3s: it becomes the
-  `/play` result when it finishes, so a slow playlist never looks stuck.
+  `/play` or `Add` result when it finishes, so a slow playlist never looks stuck. When the
+  total is unknown (a playlist URL comes back from one flat extract, so there is nothing to
+  count) the bar is indeterminate — but it moves, which is what tells the user it is alive.
+- A dead video no longer dumps yt-dlp's stderr into the channel: `resolve()` raises
+  `ResolveError` with one actionable line ("YouTube says that video is not available…") and
+  the raw error goes to `bot.log`.
 - The next track's stream URL is resolved while the current one plays (URLs are good for
   hours), which removes the yt-dlp extract from the gap between tracks. `STREAM_TTL`
   re-resolves anything queued longer than 2h.
