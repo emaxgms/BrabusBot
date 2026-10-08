@@ -563,37 +563,73 @@ class Player:
 
 # --------------------------------------------------------------------------- UI
 
+async def _say(i: discord.Interaction, text: str) -> None:
+    """Ephemeral reply that works whether the interaction is already acked or not."""
+    if i.response.is_done():
+        await i.followup.send(text, ephemeral=True)
+    else:
+        await i.response.send_message(text, ephemeral=True)
+
+
+async def _player(i: discord.Interaction) -> "Player | None":
+    """The clicking user's player, or None (+ an ephemeral reason) if unusable."""
+    p = i.client.players.get(i.guild_id)
+    if p is None or not (p.voice and p.voice.is_connected()):
+        await _say(i, "Not connected — use `/play` first.")
+        return None
+    me = i.guild.me
+    if i.user.voice is None or me.voice is None or i.user.voice.channel != me.voice.channel:
+        await _say(i, "Join the bot's voice channel first.")
+        return None
+    return p
+
+
+class AddModal(discord.ui.Modal, title="Add to queue"):
+    """Discord has no inline text input in a message - a modal is the only one there is.
+
+    ponytail: one-shot, no persistence. The last link is not remembered; that would be RAM
+    state for a field the user pastes into once.
+    """
+
+    link = discord.ui.TextInput(label="URL or search",
+                                placeholder="https://open.spotify.com/track/… or 'sultans of swing'")
+
+    async def on_submit(self, i: discord.Interaction) -> None:
+        await i.response.defer(ephemeral=True)
+        p = await _player(i)  # re-checked: the user may have left voice while typing
+        if p is None:
+            return
+        try:
+            tracks = await asyncio.to_thread(resolve, self.link.value)
+        except Exception as e:
+            return await i.followup.send(f"Could not resolve that: `{e}`", ephemeral=True)
+        if not tracks:
+            return await i.followup.send("Nothing found.", ephemeral=True)
+        await p.enqueue(tracks, i.user.display_name)
+        await p.refresh()
+        head = tracks[0].label if len(tracks) == 1 else f"{len(tracks)} tracks"
+        await i.followup.send(f"➕ Queued {head}", ephemeral=True)
+
+
 class Panel(discord.ui.View):
     """timeout=None + fixed custom_ids => survives bot restarts (re-registered in setup_hook)."""
 
     def __init__(self):
         super().__init__(timeout=None)
 
-    async def _say(self, i: discord.Interaction, text: str) -> None:
-        """Ephemeral reply that works whether the interaction is already acked or not."""
-        if i.response.is_done():
-            await i.followup.send(text, ephemeral=True)
-        else:
-            await i.response.send_message(text, ephemeral=True)
-
     async def on_error(self, i: discord.Interaction, error: Exception, item) -> None:
         # Discord only ever shows "interaction failed" - keep the real cause in bot.log.
         print(f"panel[{getattr(item, 'custom_id', '?')}] failed: {error!r}", file=sys.stderr, flush=True)
 
-    async def _player(self, i: discord.Interaction) -> Player | None:
-        p = i.client.players.get(i.guild_id)
-        if p is None or not (p.voice and p.voice.is_connected()):
-            await self._say(i, "Not connected — use `/play` first.")
-            return None
-        me = i.guild.me
-        if i.user.voice is None or me.voice is None or i.user.voice.channel != me.voice.channel:
-            await self._say(i, "Join the bot's voice channel first.")
-            return None
-        return p
+    @discord.ui.button(emoji="➕", label="Add", style=discord.ButtonStyle.success, custom_id="mb:add")
+    async def add(self, i: discord.Interaction, _b):
+        if not await _player(i):
+            return
+        await i.response.send_modal(AddModal())  # must be the first response: it is here
 
     @discord.ui.button(emoji="⏯", label="Play/Pause", style=discord.ButtonStyle.primary, custom_id="mb:toggle")
     async def toggle(self, i: discord.Interaction, _b):
-        p = await self._player(i)
+        p = await _player(i)
         if not p:
             return
         await i.response.defer()  # must precede play_next: it resolves over the network (>3s ack deadline)
@@ -607,7 +643,7 @@ class Panel(discord.ui.View):
 
     @discord.ui.button(emoji="⏭", label="Skip", style=discord.ButtonStyle.secondary, custom_id="mb:skip")
     async def skip(self, i: discord.Interaction, _b):
-        p = await self._player(i)
+        p = await _player(i)
         if not p:
             return
         await i.response.defer()
@@ -615,7 +651,7 @@ class Panel(discord.ui.View):
 
     @discord.ui.button(emoji="🔀", label="Shuffle", style=discord.ButtonStyle.secondary, custom_id="mb:shuffle")
     async def shuffle(self, i: discord.Interaction, _b):
-        p = await self._player(i)
+        p = await _player(i)
         if not p:
             return
         p.shuffle()
@@ -626,13 +662,13 @@ class Panel(discord.ui.View):
     async def queue(self, i: discord.Interaction, _b):
         # ack first: a long queue + a busy loop can blow the 3s interaction deadline
         await i.response.defer(ephemeral=True)
-        p = await self._player(i)
+        p = await _player(i)
         if p:
             await i.followup.send(embed=p.embed(), ephemeral=True)
 
     @discord.ui.button(emoji="⏹", label="Stop", style=discord.ButtonStyle.danger, custom_id="mb:stop")
     async def stop(self, i: discord.Interaction, _b):
-        p = await self._player(i)
+        p = await _player(i)
         if not p:
             return
         await i.response.defer()
@@ -1052,14 +1088,18 @@ def _check() -> int:
         v = Panel()                 # inside the loop: that is what makes clicks dispatchable
         bot.add_view(v)
         stopped = getattr(v, "_BaseView__stopped", None)
+        m = AddModal()              # the Add button's modal: no text input => nothing to paste into
         return [
-            len(v.children) == 5 and all(isinstance(c, discord.ui.Button) for c in v.children),
+            len(v.children) == 6 and all(isinstance(c, discord.ui.Button) for c in v.children),
+            "mb:add" in {c.custom_id for c in v.children},
             stopped is not None and not stopped.done(),
+            len(m.children) == 1 and isinstance(m.children[0], discord.ui.TextInput),
         ]
 
     flags = asyncio.run(panel_ok())
-    t("panel buttons wired", flags[0], " ".join(c.custom_id for c in Panel().children))
-    t("panel clickable", flags[1], "view __stopped is live (None => clicks dropped silently)")
+    t("panel buttons wired", all(flags[:2]), " ".join(c.custom_id for c in Panel().children))
+    t("panel clickable", flags[2], "view __stopped is live (None => clicks dropped silently)")
+    t("add modal has its input", flags[3], f"{len(AddModal().children)} component(s)")
 
     names = {c.name for c in bot.tree.get_commands()}
     want = {"play", "playnext", "pause", "resume", "skip", "shuffle", "queue", "stop", "panel",
