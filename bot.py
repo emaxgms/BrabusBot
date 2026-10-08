@@ -25,6 +25,7 @@ import time
 import urllib.request
 from array import array
 from dataclasses import dataclass, field
+from functools import partial
 
 import discord
 import yt_dlp
@@ -76,7 +77,9 @@ _NODE = shutil.which("node") or "/home/ema/.local/bin/node"
 if os.access(_NODE, os.X_OK):
     YTDL_OPTS["js_runtimes"] = {"node": {"path": _NODE}}
 
-FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin"
+# rw_timeout: without it a silently dead connection blocks the reader forever; with it
+# ffmpeg errors out after 15s of no data and the reconnect logic takes over.
+FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -rw_timeout 15000000 -nostdin"
 FFMPEG_OPTS = "-vn -loglevel error"
 
 
@@ -359,10 +362,14 @@ class Player:
         self.channel: discord.abc.Messageable | None = None
         self.loop = asyncio.get_running_loop()  # _after runs on ffmpeg's thread and needs a loop ref
         self._advancing = False
-        self._pending = False
+        self._pending = 0  # advance requests held back by the guard (counted, see _replay)
         self._started = False
         self._prefetching: Track | None = None
         self._idle: asyncio.Task | None = None
+        self._source = None  # current PCMVolumeTransformer, so a stalled one can be killed
+        self._epoch = 0  # bumped per track and on halt: stale `after` callbacks are ignored
+        self._played_at = 0.0  # when the current track started (early-death detection)
+        self._user_stop = False  # skip()/stop() are deliberate: no "dropped mid-stream" warning
 
     # --- voice plumbing -----------------------------------------------------
     async def connect(self, channel: discord.VoiceChannel) -> discord.VoiceClient:
@@ -395,17 +402,27 @@ class Player:
         # and the first one is silently lost. Dropped when play_next gets an await-free path.
         if self._advancing:
             # A caller that lands here must be DEFERRED when the in-flight call has already
-            # started a track (its ffmpeg died instantly -> the event means "advance again"),
-            # but dropped when it is merely resolving: there the event is a duplicate of the
-            # advance already under way. Dropping the first case strands a full queue forever
-            # ("bot joined the channel and never plays anything").
+            # started a track (its ffmpeg died instantly, or a user pressed Skip -> the event
+            # means "advance again"), but dropped when it is merely resolving: there the event
+            # is a duplicate of the advance already under way. Dropping the first case strands
+            # a full queue forever ("bot joined the channel and never plays anything").
             if self._started:
-                self._pending = True
+                self._pending += 1
             return
         self._advancing = True
         self._started = False
         try:
-            self.current = None
+            # A track that died before its duration ran out (403, reset, stall) must be
+            # reported, or it silently vanishes and the changeover looks like a glitch.
+            prev, self.current = self.current, None
+            if prev is not None and not self._user_stop and prev.duration:
+                played = time.monotonic() - self._played_at
+                if played < prev.duration - 15:  # 15s slack: shorter leftovers are an edit
+                    print(f"play: stream died on {prev.title!r} after {played:.0f}s of "
+                          f"{prev.duration}s" + (f": {str(error).splitlines()[0][:120]}" if error else ""),
+                          flush=True)
+                    await self.notify(f"⚠️ **{prev.title[:60]}** dropped mid-stream, skipping.")
+            self._user_stop = False
             if not (self.voice and self.voice.is_connected()):
                 await self.refresh()
                 return
@@ -421,14 +438,14 @@ class Player:
                     return  # stopped while resolving
                 track.stream = None  # URLs expire; re-resolve next time
                 self.current = track
-                self.voice.play(
-                    discord.PCMVolumeTransformer(
-                        discord.FFmpegPCMAudio(url, before_options=FFMPEG_BEFORE, options=FFMPEG_OPTS),
-                        volume=VOLUME,
-                    ),
-                    after=self._after,
+                self._epoch += 1
+                self._source = discord.PCMVolumeTransformer(
+                    discord.FFmpegPCMAudio(url, before_options=FFMPEG_BEFORE, options=FFMPEG_OPTS),
+                    volume=VOLUME,
                 )
+                self.voice.play(self._source, after=partial(self._after, epoch=self._epoch))
                 self._started = True
+                self._played_at = time.monotonic()
                 await self.refresh()
                 self.cancel_idle()
                 self._prefetch()  # resolve the next one while this plays
@@ -438,15 +455,32 @@ class Player:
         finally:
             self._advancing = False
             if self._pending:
-                self._pending = False
-                asyncio.create_task(self.play_next())
+                n, self._pending = self._pending, 0
+                asyncio.create_task(self._replay(n))
 
-    def _after(self, error: Exception | None) -> None:
-        """Runs in ffmpeg's thread - hop back to the event loop."""
+    def _after(self, error: Exception | None, epoch: int) -> None:
+        """Runs in ffmpeg's thread - hop back to the event loop.
+
+        Killing a stalled source also fires its `after`; the epoch tells those stale
+        callbacks apart from the live track's (a stale one would double-advance the queue).
+        """
+        if epoch != self._epoch:
+            return
         try:
             asyncio.run_coroutine_threadsafe(self.play_next(error), self.loop)
         except RuntimeError:
             pass  # loop already closed (shutdown)
+
+    async def _replay(self, n: int) -> None:
+        """Run the advances that the guard held back while a play_next was in flight.
+
+        Each arrives with a track just started (a Skip pressed during the transition) or
+        just dead (its ffmpeg failed instantly): cut whatever is playing, then advance.
+        """
+        for _ in range(n):
+            if self.voice and (self.voice.is_playing() or self.voice.is_paused()):
+                self._halt()  # the deferred skip means "cut the track that just started"
+            await self.play_next()
 
     # --- queue plumbing -----------------------------------------------------
     def _prefetch(self) -> None:
@@ -501,17 +535,40 @@ class Player:
                 self._idle = None
 
     # --- controls -----------------------------------------------------------
+    def _halt(self) -> None:
+        """Stop the current track AND kill its ffmpeg.
+
+        voice.stop() does not wake a player thread blocked in read() on a stalled stream:
+        without killing the source, the `after` callback (which advances the queue) waits
+        for ffmpeg's reconnect loop to give up - minutes. That is the "Skip does nothing".
+        """
+        if not self.voice:
+            return
+        self._epoch += 1  # the kill below fires `after`; we advance ourselves, ignore it
+        src = self.voice.source  # grab before stop(): it drops the player reference
+        self.voice.stop()
+        if src is not None:
+            try:
+                src.cleanup()  # SIGKILLs ffmpeg -> a blocked read() returns EOF at once
+            except Exception:
+                pass
+
     async def skip(self) -> None:
-        if self.voice and (self.voice.is_playing() or self.voice.is_paused()):
-            self.voice.stop()  # triggers _after -> play_next
+        self._user_stop = True
+        playing = bool(self.voice and (self.voice.is_playing() or self.voice.is_paused()))
+        if playing:
+            self._halt()  # works even when the stream is stalled
+        if self._advancing:
+            self._pending += 1  # mid-transition: hold the skip, _replay will run it
         else:
             await self.play_next()
 
     async def stop(self) -> None:
+        self._user_stop = True
         self.queue.clear()
         self.current = None
         if self.voice:
-            self.voice.stop()
+            self._halt()
             await self.voice.disconnect()
             self.voice = None
         await self.refresh()
@@ -552,6 +609,23 @@ class Player:
             await self.panel.edit(embed=self.embed(status), view=panel_view())
         except discord.HTTPException:
             self.panel = None  # message deleted -> a new one is posted on the next command
+
+    async def to_bottom(self, status: str = "") -> None:
+        """Delete the panel and repost it as the newest message.
+
+        Discord has no sticky messages; the old panel sits above every reply that lands
+        below it. Reposting after a command keeps it at the bottom, and the old panel is
+        removed instead of piling up.
+        """
+        if self.channel is None:
+            return
+        old, self.panel = self.panel, None
+        if old is not None:
+            try:
+                await old.delete()
+            except discord.HTTPException:
+                pass
+        self.panel = await self.channel.send(embed=self.embed(status), view=panel_view())
 
     async def notify(self, text: str) -> None:
         if self.channel:
@@ -606,9 +680,52 @@ class AddModal(discord.ui.Modal, title="Add to queue"):
         if not tracks:
             return await i.followup.send("Nothing found.", ephemeral=True)
         await p.enqueue(tracks, i.user.display_name)
-        await p.refresh()
+        await p.to_bottom()  # keep the panel at the bottom after adding
         head = tracks[0].label if len(tracks) == 1 else f"{len(tracks)} tracks"
         await i.followup.send(f"➕ Queued {head}", ephemeral=True)
+
+
+def parse_order(text: str) -> list[int]:
+    """Positions out of a free-form string: '3 1 2', '3,1,2' and '3\\n1\\n2' all work."""
+    return [int(n) for n in re.findall(r"\d+", text)]
+
+
+def queue_order(q: list[Track], order: list[int]) -> bool:
+    """Reorder `q` in place from a 1-based permutation. False if `order` is not one."""
+    if sorted(order) != list(range(1, len(q) + 1)):
+        return False
+    q[:] = [q[i - 1] for i in order]
+    return True
+
+
+class OrderModal(discord.ui.Modal, title="Reorder the queue"):
+    """Type the new order as positions; the field is pre-filled with the current one.
+
+    ponytail: Discord has no drag & drop and a modal holds at most 5 fields, so the whole
+    queue is edited as ONE permutation. The queue can move while the modal is open (a /play
+    lands): the submitted permutation then no longer matches and is refused, never applied
+    to the wrong tracks.
+    """
+
+    order = discord.ui.TextInput(label="Positions, top first (e.g. 3 1 2)",
+                                 style=discord.TextStyle.paragraph, required=True)
+
+    def __init__(self, n: int):
+        super().__init__()
+        self.order.default = " ".join(str(k) for k in range(1, n + 1))
+
+    async def on_submit(self, i: discord.Interaction) -> None:
+        await i.response.defer(ephemeral=True)
+        p = await _player(i)
+        if p is None:
+            return
+        nums = parse_order(self.order.value)
+        if not queue_order(p.queue, nums):
+            return await i.followup.send(
+                f"Send every position from 1 to {len(p.queue)} exactly once, e.g. `3 1 2 …`.",
+                ephemeral=True)
+        await p.refresh("Reordered")
+        await i.followup.send("↕️ Queue reordered.", ephemeral=True)
 
 
 class Panel(discord.ui.View):
@@ -626,6 +743,15 @@ class Panel(discord.ui.View):
         if not await _player(i):
             return
         await i.response.send_modal(AddModal())  # must be the first response: it is here
+
+    @discord.ui.button(emoji="↕️", label="Order", style=discord.ButtonStyle.secondary, custom_id="mb:order")
+    async def order(self, i: discord.Interaction, _b):
+        p = await _player(i)
+        if not p:
+            return
+        if not p.queue:
+            return await _say(i, "The queue is empty — nothing to reorder.")
+        await i.response.send_modal(OrderModal(len(p.queue)))  # must be the first response
 
     @discord.ui.button(emoji="⏯", label="Play/Pause", style=discord.ButtonStyle.primary, custom_id="mb:toggle")
     async def toggle(self, i: discord.Interaction, _b):
@@ -748,7 +874,6 @@ async def enqueue_query(ctx: commands.Context, query: str, front: bool = False) 
         return await ctx.send("Nothing found.")
 
     await p.enqueue(tracks, ctx.author.display_name, front=front)
-    await p.refresh()
     head = tracks[0] if len(tracks) == 1 else f"{len(tracks)} tracks"
     text = (f"➕ Queued {head if isinstance(head, str) else head.label}"
             + (f"\n⚠️ {len(skipped)} unavailable (age/geo/removed): "
@@ -759,6 +884,7 @@ async def enqueue_query(ctx: commands.Context, query: str, front: bool = False) 
         await msg.edit(content=text, embed=None)  # the loading line becomes the result
     else:
         await ctx.send(text)
+    await p.to_bottom()  # repost the panel below the reply: pin it at the bottom
 
 
 @bot.hybrid_command(description="Play a URL (Spotify/YouTube/…), search a song, or load a saved playlist")
@@ -871,6 +997,31 @@ async def shuffle(ctx: commands.Context):
     await ctx.send(f"🔀 Shuffled {len(p.queue)} tracks", ephemeral=True)
 
 
+def queue_move(q: list[Track], source: int, target: int) -> bool:
+    """1-based move inside the queue; False when `source` is out of range.
+
+    `target` is clamped, so /move 3 999 means "send it to the end" instead of an error.
+    """
+    n = len(q)
+    if not 1 <= source <= n:
+        return False
+    target = max(1, min(target, n))
+    if source != target:
+        q.insert(target - 1, q.pop(source - 1))
+    return True
+
+
+@bot.hybrid_command(description="Move a queued track to another position (e.g. /move 14 1)")
+async def move(ctx: commands.Context, source: int, target: int):
+    p = player(ctx)
+    if not queue_move(p.queue, source, target):
+        return await ctx.send(
+            f"The queue has {len(p.queue)} track(s) — position `{source}` is out of range.", ephemeral=True)
+    await p.refresh("Reordered")
+    pos = max(1, min(target, len(p.queue)))
+    await ctx.send(f"↕️ Moved **{p.queue[pos - 1].title}** to position {pos}", ephemeral=True)
+
+
 @bot.hybrid_command(description="Show the queue")
 async def queue(ctx: commands.Context):
     p = player(ctx)
@@ -888,8 +1039,7 @@ async def stop(ctx: commands.Context):
 async def panel(ctx: commands.Context, ephemeral: bool = False):
     p = player(ctx)
     p.channel = ctx.channel
-    p.panel = None
-    p.panel = await ctx.channel.send(embed=p.embed(), view=panel_view())
+    await p.to_bottom()  # deletes the old panel and moves it to the bottom
     if ephemeral:
         await ctx.send("Panel posted.", ephemeral=True)
 
@@ -904,6 +1054,7 @@ class _FakeVoice:
         self.connected = True
         self.playing = False
         self.paused = False
+        self.source = None  # VoiceClient.source: _halt() reads it before stopping
 
     def is_connected(self):
         return self.connected
@@ -917,6 +1068,7 @@ class _FakeVoice:
     def play(self, source, after=None):
         self.played.append(source)
         self.after = after
+        self.source = source
         self.playing, self.paused = True, False
 
     def stop(self):
@@ -1089,20 +1241,50 @@ def _check() -> int:
         bot.add_view(v)
         stopped = getattr(v, "_BaseView__stopped", None)
         m = AddModal()              # the Add button's modal: no text input => nothing to paste into
+        om = OrderModal(3)          # the Order button's modal: pre-filled with the current order
         return [
-            len(v.children) == 6 and all(isinstance(c, discord.ui.Button) for c in v.children),
-            "mb:add" in {c.custom_id for c in v.children},
+            len(v.children) == 7 and all(isinstance(c, discord.ui.Button) for c in v.children),
+            {"mb:add", "mb:order"} <= {c.custom_id for c in v.children},
             stopped is not None and not stopped.done(),
             len(m.children) == 1 and isinstance(m.children[0], discord.ui.TextInput),
+            len(om.children) == 1 and om.order.default == "1 2 3",
         ]
 
     flags = asyncio.run(panel_ok())
     t("panel buttons wired", all(flags[:2]), " ".join(c.custom_id for c in Panel().children))
     t("panel clickable", flags[2], "view __stopped is live (None => clicks dropped silently)")
     t("add modal has its input", flags[3], f"{len(AddModal().children)} component(s)")
+    t("order modal is pre-filled", flags[4], f"default={OrderModal(3).order.default!r}")
+
+    def reorder_ok() -> list[bool]:
+        q = [Track(f"t{i}") for i in range(1, 6)]
+        ok = [queue_order(q, parse_order("3,1 2\n4 5")) and [t.title for t in q] == ["t3", "t1", "t2", "t4", "t5"],
+              not queue_order(q, parse_order("1 2 3")) and [t.title for t in q] == ["t3", "t1", "t2", "t4", "t5"],
+              not queue_order(q, parse_order("1 1 2 3 4")),      # duplicate -> refused whole
+              not queue_order(q, parse_order("1 2 3 4 6")),      # out of range -> refused whole
+              # a permutation applies to the CURRENT order: reverse of [t3,t1,t2,t4,t5]
+              queue_order(q, parse_order("5 4 3 2 1")) and [t.title for t in q] == ["t5", "t4", "t2", "t1", "t3"],
+              queue_order([], [])]                               # empty queue is a no-op, not a crash
+        return ok
+
+    flags = reorder_ok()
+    t("queue reorder by permutation", all(flags),
+      f"{sum(flags)}/{len(flags)} asserts, failed {[i for i, f in enumerate(flags) if not f]}")
+
+    def move_ok() -> list[bool]:
+        q = [Track(f"t{i}") for i in range(1, 6)]
+        ok = [queue_move(q, 4, 1) and [t.title for t in q] == ["t4", "t1", "t2", "t3", "t5"],
+              queue_move(q, 2, 99) and [t.title for t in q] == ["t4", "t2", "t3", "t5", "t1"],  # clamped to the end
+              not queue_move(q, 9, 1) and [t.title for t in q] == ["t4", "t2", "t3", "t5", "t1"],
+              queue_move(q, 3, 3) and [t.title for t in q] == ["t4", "t2", "t3", "t5", "t1"]]  # no-op
+        return ok
+
+    flags = move_ok()
+    t("queue move command", all(flags),
+      f"{sum(flags)}/{len(flags)} asserts, failed {[i for i, f in enumerate(flags) if not f]}")
 
     names = {c.name for c in bot.tree.get_commands()}
-    want = {"play", "playnext", "pause", "resume", "skip", "shuffle", "queue", "stop", "panel",
+    want = {"play", "playnext", "pause", "resume", "skip", "shuffle", "move", "queue", "stop", "panel",
             "plsave", "pladd", "plrm", "pllist", "pldel"}
     t("slash commands registered", want <= names, ",".join(sorted(want & names)))
 
@@ -1315,6 +1497,85 @@ def _check() -> int:
 
     flags = asyncio.run(progress_error_ok())
     t("progress line cleaned up on failure", all(flags), f"{sum(flags)}/{len(flags)} asserts")
+
+    # a skip pressed while a transition is resolving must survive the guard, or the track
+    # being resolved plays anyway and the button looks dead
+    async def skip_mid_transition() -> list[bool]:
+        p = Player(bot, None)  # type: ignore[arg-type]
+        p.voice = _FakeVoice()  # type: ignore[assignment]
+        p.queue = [Track("q", "http://x", stream="memory://s")]
+        p._advancing = True  # a resolve for the next track is in flight
+        await p.skip()
+        r = [p._pending == 1, len(p.voice.played) == 0]
+        p._pending = 0
+        return r
+
+    flags = asyncio.run(skip_mid_transition())
+    t("skip during a transition is counted", all(flags), f"{sum(flags)}/{len(flags)} asserts")
+
+    # the panel is deleted and reposted as the newest message (user: keep it at the bottom)
+    async def panel_bottom() -> list[bool]:
+        class _P(_Msg):
+            def __init__(self, c, i):
+                self.c, self.id = c, i
+
+            async def edit(self, **kw):
+                self.c.edits += 1
+                await asyncio.sleep(0)
+
+            async def delete(self):
+                self.c.deleted.append(self.id)
+                await asyncio.sleep(0)
+
+        class _C:
+            def __init__(self):
+                self.sent, self.deleted, self.edits = [], [], 0
+
+            async def send(self, *a, **kw):
+                m = _P(self, 100 + len(self.sent))
+                self.sent.append(m)
+                await asyncio.sleep(0)
+                return m
+
+        p = Player(bot, None)  # type: ignore[arg-type]
+        p.channel = _C()  # type: ignore[assignment]
+        await p.to_bottom()  # first panel: nothing to delete
+        first = p.panel
+        await p.to_bottom()  # repost: the old one is deleted, the new one is newest
+        return [len(p.channel.sent) == 2,
+                p.panel is not first,
+                p.channel.deleted == [first.id],
+                p.panel.id == 101]
+
+    flags = asyncio.run(panel_bottom())
+    t("panel reposts to the bottom", all(flags), f"{sum(flags)}/{len(flags)} asserts")
+
+    # a stream dying right after start must be reported, not silently skipped
+    async def early_death() -> list[bool]:
+        class _C(_Chan):
+            def __init__(self):
+                self.msgs = []
+
+            async def send(self, *a, **kw):
+                self.msgs.append(str(a[0] if a else kw))
+                await asyncio.sleep(0)
+                return _Msg()
+
+        p = Player(bot, None)  # type: ignore[arg-type]
+        p.voice = _FakeVoice()  # type: ignore[assignment]
+        p.channel = _C()  # type: ignore[assignment]
+        p.current = Track("gone", "http://x", duration=200, stream="memory://s")
+        p._played_at = time.monotonic()  # it started just now...
+        p.queue = [Track("next", "http://x", stream="memory://s")]
+        await p.play_next()  # ...and died right away: this is the advance after the death
+        r = [any("dropped mid-stream" in m for m in p.channel.msgs),
+             p.current is not None and p.current.title == "next"]
+        for src in p.voice.played:
+            src.cleanup()
+        return r
+
+    flags = asyncio.run(early_death())
+    t("early stream death is reported", all(flags), f"{sum(flags)}/{len(flags)} asserts")
 
     return 0 if ok else 1
 

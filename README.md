@@ -5,14 +5,21 @@ Bandcamp, Vimeo, Twitch, 1000+ sites) plus Spotify links. Slash commands + a
 button panel in the channel.
 
 ```
-/play <url or search>   /playnext <url or search>   /pause  /resume  /skip  /shuffle  /queue  /stop  /panel
+/play <url or search>   /playnext <url or search>   /pause  /resume  /skip  /shuffle  /move <n> <n>  /queue  /stop  /panel
 /plsave <name> [<url or search>]   /pladd <name> <url or search>   /plrm <name> <n>   /pllist [<name>]   /pldel <name>
 ```
 
 `/play <name>` loads a saved playlist (matched by name before any search), `/playnext`
 jumps the queue. `/plsave <name>` with no query snapshots the current queue.
+`/move 14 1` moves queue position 14 to position 1 (the target is clamped, so `/move 3 999`
+sends it to the end).
 
-Panel buttons: ⏯ play/pause · ⏭ skip · 🔀 shuffle · 📜 queue · ⏹ stop & disconnect
+Panel buttons: ➕ add (paste a link or search) · ↕️ order (reorder the queue) · ⏯ play/pause ·
+⏭ skip · 🔀 shuffle · 📜 queue · ⏹ stop & disconnect
+
+`↕️ order` opens a modal pre-filled with `1 2 3 …`: rewrite it as the permutation you want
+(`3 1 2 …`) and submit. Discord has no drag & drop and a modal holds at most 5 fields, so the
+whole queue is edited as one list of positions, not by dragging rows.
 
 ## Setup
 
